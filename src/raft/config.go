@@ -280,6 +280,7 @@ func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
 	// a fresh set of outgoing ClientEnd names.
 	// so that old crashed instance's ClientEnds can't send.
 	cfg.endnames[i] = make([]string, cfg.n)
+	// 这里生成了n * n个随机20长度的字符串指代从i到j的连接
 	for j := 0; j < cfg.n; j++ {
 		cfg.endnames[i][j] = randstring(20)
 	}
@@ -287,7 +288,9 @@ func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
 	// a fresh set of ClientEnds.
 	ends := make([]*labrpc.ClientEnd, cfg.n)
 	for j := 0; j < cfg.n; j++ {
+		// 每个end都有不同名字，但有相同的通道ch和done
 		ends[j] = cfg.net.MakeEnd(cfg.endnames[i][j])
+		// 这里就是让rn.connections[表示i->j的终端名] = j
 		cfg.net.Connect(cfg.endnames[i][j], j)
 	}
 
@@ -299,6 +302,7 @@ func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
 	// new instance's persisted state.
 	// but copy old persister's content so that we always
 	// pass Make() the last persisted state.
+	// 这里和持久性有关，应该是快照之类的实现
 	if cfg.saved[i] != nil {
 		cfg.saved[i] = cfg.saved[i].Copy()
 
@@ -319,12 +323,14 @@ func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
 
 	applyCh := make(chan ApplyMsg)
 
+	// 这里才是起点，将i节点对应的全部客户终端，i下标，持久信息saved，通道都传过去
 	rf := Make(ends, i, cfg.saved[i], applyCh)
 
 	cfg.mu.Lock()
 	cfg.rafts[i] = rf
 	cfg.mu.Unlock()
 
+	// 节点i将不断读取applyCh中的响应
 	go applier(i, applyCh)
 
 	svc := labrpc.MakeService(rf)
@@ -363,6 +369,7 @@ func (cfg *config) connect(i int) {
 	cfg.connected[i] = true
 
 	// outgoing ClientEnds
+	// 从当前节点i->j
 	for j := 0; j < cfg.n; j++ {
 		if cfg.connected[j] {
 			endname := cfg.endnames[i][j]
@@ -371,6 +378,7 @@ func (cfg *config) connect(i int) {
 	}
 
 	// incoming ClientEnds
+	// 从外来节点j->当前节点i
 	for j := 0; j < cfg.n; j++ {
 		if cfg.connected[j] {
 			endname := cfg.endnames[j][i]

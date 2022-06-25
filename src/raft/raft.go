@@ -21,11 +21,9 @@ import (
 	//	"bytes"
 	"sync"
 	"sync/atomic"
-
 	//	"6.824/labgob"
 	"6.824/labrpc"
 )
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -50,6 +48,14 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type Role int
+
+const (
+	Follower  Role = 1
+	Candidate Role = 2
+	Leader    Role = 3
+)
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -60,6 +66,21 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
+	// 常规
+	leaderId int  // 领导id
+	role     Role // 角色
+	// state
+	currentTerm int      // 服务器看到的最新任期，初始化为0，
+	votedFor    int      // candidateId
+	log         []string // entry数组，每个entry都包含一个对状态机的操作，以及leader收到该操作时的任期（从1开始）
+	commitIndex int      // log中已提交entry的最大索引（提交？
+	lastApplied int      // log中已应用entry的最大索引
+	nextIndex   []int    // leader专属：内容是发送给每个server的下一个log的索引
+	matchIndex  []int    // leader专属：每个server已经复制log的最高索引
+
+	//State     int
+	//lastCheck time.Time
+	//LeaderId  int
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -70,10 +91,10 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	var term int
-	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+	term := rf.currentTerm
+	isLeader := rf.me == rf.leaderId
+	return term, isLeader
 }
 
 //
@@ -91,7 +112,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -115,7 +135,6 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
 //
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
@@ -136,28 +155,48 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
-//
+// RequestVoteArgs
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int // 候选人的任期
+	CandidateId  int // 候选人的id
+	LastLogIndex int // 候选人最新log的下标
+	LastLogTerm  int // 候选人最新log对应term
 }
 
-//
+// RequestVoteReply
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int  // 当前任期
+	VoteGranted bool // 投票同意候选人与否
 }
 
-//
+// RequestVote
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	if args.Term < rf.currentTerm {
+		*reply = RequestVoteReply{
+			Term:        rf.currentTerm,
+			VoteGranted: false,
+		}
+		return
+	}
+
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && args.LastLogTerm >= rf.currentTerm {
+		rf.votedFor = args.CandidateId
+		*reply = RequestVoteReply{
+			Term:        rf.currentTerm,
+			VoteGranted: true,
+		}
+	}
 }
 
 //
@@ -194,7 +233,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -215,7 +253,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -249,7 +286,8 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-
+		// 如果「选举时间」过去依然没有收到append消息（不管），也没有收到投票请求，则自己当候选人
+		//if rf.role ==
 	}
 }
 
@@ -272,13 +310,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	// 2A
+	rf.leaderId = -1
+	rf.currentTerm = 0
+	rf.votedFor = -1
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 
 	return rf
 }
