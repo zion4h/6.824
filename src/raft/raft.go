@@ -18,9 +18,13 @@ package raft
 //
 
 import (
+	"fmt"
+	"math/rand"
 	//	"bytes"
 	"sync"
 	"sync/atomic"
+	"time"
+
 	//	"6.824/labgob"
 	"6.824/labrpc"
 )
@@ -67,8 +71,15 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// 常规
-	leaderId int  // 领导id
-	role     Role // 角色
+	role            Role // 角色
+	StartAt         time.Time
+	electionTimeout time.Duration
+	electionChan    chan bool
+	heartbeatChan   chan bool
+
+	//leaderId int // 领导id
+	//lastReceiveHeart time.Time
+	//heartbeatTimeout time.Duration
 	// state
 	currentTerm int      // 服务器看到的最新任期，初始化为0，
 	votedFor    int      // candidateId
@@ -93,7 +104,7 @@ func (rf *Raft) GetState() (int, bool) {
 
 	// Your code here (2A).
 	term := rf.currentTerm
-	isLeader := rf.me == rf.leaderId
+	isLeader := rf.role == Leader
 	return term, isLeader
 }
 
@@ -182,21 +193,65 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	if args.Term < rf.currentTerm {
+	if rf.currentTerm < args.Term {
+		rf.toFollower()
+		rf.currentTerm = args.Term
+	}
+
+	if rf.currentTerm > args.Term || (rf.votedFor != -1 && rf.votedFor != args.CandidateId) {
 		*reply = RequestVoteReply{
 			Term:        rf.currentTerm,
 			VoteGranted: false,
 		}
-		return
-	}
-
-	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && args.LastLogTerm >= rf.currentTerm {
+	} else {
 		rf.votedFor = args.CandidateId
 		*reply = RequestVoteReply{
 			Term:        rf.currentTerm,
 			VoteGranted: true,
 		}
 	}
+}
+
+type AppendEntriesArgs struct {
+	// Your data here (2A, 2B).
+	Term         int //
+	LeaderId     int //
+	PrevLogIndex int //
+	PrevLogTerm  int //
+	Entries      []string
+	LeaderCommit string
+}
+
+type AppendEntriesReply struct {
+	Term    int  //
+	Success bool //
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if args.Term < rf.currentTerm {
+		*reply = AppendEntriesReply{
+			Term:    rf.currentTerm,
+			Success: false,
+		}
+		return
+	}
+
+	rf.resetTimer()
+
+	if args.Term > rf.currentTerm || rf.role != Follower {
+		rf.toFollower()
+		rf.currentTerm = args.Term
+	}
+
+	*reply = AppendEntriesReply{
+		Term:    rf.currentTerm,
+		Success: true,
+	}
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
 }
 
 //
@@ -282,12 +337,111 @@ func (rf *Raft) killed() bool {
 // heartsbeats recently.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		// 如果「选举时间」过去依然没有收到append消息（不管），也没有收到投票请求，则自己当候选人
-		//if rf.role ==
+		rf.mu.Lock()
+		if rf.role != Leader {
+			if time.Now().Sub(rf.StartAt) > rf.electionTimeout {
+				//fmt.Println("开启新选举")
+				rf.electionChan <- true
+			}
+		}
+		rf.mu.Unlock()
+
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// ********************* 状态切换 ******************************
+// 重置计时器
+func (rf *Raft) resetTimer() {
+	rf.StartAt = time.Now()
+	rf.electionTimeout = time.Duration(150 + rand.Intn(150))
+}
+
+func (rf *Raft) CheckChannel() {
+	for {
+		select {
+		case <-rf.electionChan:
+			//fmt.Println("开启真正的新选举")
+			rf.toCandidate()
+		case <-rf.heartbeatChan:
+			rf.toLeader()
+		}
+	}
+}
+
+func (rf *Raft) toFollower() {
+	rf.role = Follower
+	rf.votedFor = -1
+	rf.resetTimer()
+}
+
+func (rf *Raft) toCandidate() {
+	rf.role = Candidate
+	rf.currentTerm = rf.currentTerm + 1
+	rf.votedFor = rf.me
+	rf.resetTimer()
+	//fmt.Println("转换开启")
+
+	cnt := 1 // 自己也要计票
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+
+		args := RequestVoteArgs{
+			Term:        rf.currentTerm,
+			CandidateId: rf.me,
+			//LastLogIndex int // 候选人最新log的下标
+			//LastLogTerm  int // 候选人最新log对应term
+		}
+		reply := RequestVoteReply{}
+		if rf.sendRequestVote(i, &args, &reply) {
+			//fmt.Printf("%v 向 %v 发送投票请求，%v的是否投票：%v\n", rf.me, i, i, reply.VoteGranted)
+			if reply.VoteGranted {
+				cnt++
+			}
+
+			if reply.Term > rf.currentTerm {
+				rf.currentTerm = reply.Term
+				rf.toFollower()
+				return
+			}
+
+			if cnt > len(rf.peers)/2 {
+				rf.toLeader()
+				return
+			}
+		}
+	}
+}
+
+func (rf *Raft) toLeader() {
+	rf.role = Leader
+	fmt.Println(rf.me, "开始成为leader...")
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+
+		args := AppendEntriesArgs{
+			Term: rf.currentTerm,
+		}
+		reply := AppendEntriesReply{}
+		if rf.sendAppendEntries(i, &args, &reply) {
+			//if rf.role != Leader {
+			//	return
+			//}
+
+			if reply.Success {
+			} else {
+				rf.toFollower()
+				rf.currentTerm = reply.Term
+				return
+			}
+		}
 	}
 }
 
@@ -311,14 +465,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	// 2A
-	rf.leaderId = -1
+	// 初始没有领导，周期从0开始，也未投票给别人
 	rf.currentTerm = 0
-	rf.votedFor = -1
+	rf.electionChan = make(chan bool)
+	rf.heartbeatChan = make(chan bool)
+	rf.toFollower()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
+	go rf.CheckChannel()
 	go rf.ticker()
 
 	return rf
