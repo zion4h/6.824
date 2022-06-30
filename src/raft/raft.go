@@ -72,6 +72,7 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
+	// 2A
 	role                 Role // 角色
 	StartAt              time.Time
 	electionTimeout      time.Duration
@@ -81,6 +82,7 @@ type Raft struct {
 	onLeaderCond         *sync.Cond
 	offLeaderCond        *sync.Cond
 
+	// 2B
 	currentTerm int
 	votedFor    int
 	log         []Entry // entry数组，每个entry都包含一个对状态机的操作，以及leader收到该操作时的任期（从1开始，因为周期0没领导）
@@ -354,7 +356,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 								rf.mu.Unlock()
 								return
 							} else {
+								// 论文：the leader can decrement nextIndex to bypass all the conflicting entries in that term
+								// 可以降低rpc
 								idx := args.PrevLogIndex - 1
+								for idx > 0 && rf.log[idx].Term == args.PrevLogTerm {
+									idx--
+								}
 								args.PrevLogIndex = idx
 								args.PrevLogTerm = rf.log[idx].Term
 								args.Entries = rf.log[idx+1:]
@@ -375,6 +382,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 					}
 					rf.mu.Unlock()
 				}
+				time.Sleep(time.Millisecond * 5)
 			}
 
 		}(i)
@@ -534,8 +542,8 @@ func (rf *Raft) sendHeartbeat() {
 			Entries:      []Entry{},
 			LeaderCommit: rf.commitIndex,
 		}
-		rf.mu.Unlock()
 		var reply AppendEntriesReply
+		rf.mu.Unlock()
 
 		go func(server int) {
 			// 检测到一致性冲突就重复提交请求直到一致
@@ -551,8 +559,8 @@ func (rf *Raft) sendHeartbeat() {
 					return
 				}
 
+				rf.mu.Lock()
 				if reply.Term > args.Term {
-					rf.mu.Lock()
 					rf.currentTerm = reply.Term
 					rf.ChangeRole(Follower)
 					rf.votedFor = -1
@@ -561,20 +569,21 @@ func (rf *Raft) sendHeartbeat() {
 					return
 				}
 
-				rf.mu.Lock()
 				if rf.currentTerm == args.Term && rf.role == Leader {
-					conflictTerm := args.Term
-					idx := args.PrevLogIndex
-					for ; idx > 0 && rf.log[idx].Term == conflictTerm; idx-- {
+					idx := args.PrevLogIndex - 1
+					for idx > 0 && rf.log[idx].Term == args.PrevLogTerm {
+						idx--
 					}
 					args.PrevLogIndex = idx
 					args.PrevLogTerm = rf.log[idx].Term
 					args.Entries = rf.log[idx+1:]
+
 				} else {
 					rf.mu.Unlock()
 					return
 				}
 				rf.mu.Unlock()
+				time.Sleep(time.Millisecond * 5)
 			}
 		}(i)
 	}
